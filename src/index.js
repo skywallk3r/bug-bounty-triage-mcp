@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
-const UA = "bug-bounty-triage-mcp/1.0 (+https://github.com/skywallk3r/bug-bounty-triage-mcp)";
+const UA = "bug-bounty-triage-mcp/1.1 (+https://github.com/skywallk3r/bug-bounty-triage-mcp)";
 
 async function fetchJson(url, timeoutMs = 15000) {
   const res = await fetch(url, {
@@ -61,14 +61,21 @@ function severityBand(score) {
   return "Critical";
 }
 
+const READ_ONLY_LOCAL = { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true };
+const READ_ONLY_WEB = { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true };
+
 // ---------- Server ----------
 function buildServer() {
-  const server = new McpServer({ name: "bug-bounty-triage-mcp", version: "1.0.0" });
+  const server = new McpServer({ name: "bug-bounty-triage-mcp", version: "1.1.0" });
 
-  server.tool(
+  server.registerTool(
     "wp_plugin_lookup",
-    "Look up a WordPress plugin on wordpress.org: current version, active installs, last updated, requirements and rating. Use before hunting a plugin to check freshness and reach.",
-    { slug: z.string().min(1).describe("Plugin slug, e.g. 'akismet' or 'one-click-order-reorder'") },
+    {
+      title: "WordPress Plugin Lookup",
+      description: "Look up a WordPress plugin on wordpress.org: current version, active installs, last updated, requirements and rating. Use before hunting a plugin to check freshness and reach. Read-only; queries the public wordpress.org API.",
+      inputSchema: { slug: z.string().min(1).describe("Plugin slug, e.g. 'akismet' or 'one-click-order-reorder'") },
+      annotations: READ_ONLY_WEB,
+    },
     async ({ slug }) => {
       const clean = slug.trim().toLowerCase().replace(/[^a-z0-9-_]/g, "");
       const url = `https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request[slug]=${encodeURIComponent(clean)}&request[fields][sections]=0&request[fields][versions]=0`;
@@ -94,12 +101,16 @@ function buildServer() {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "cve_lookup",
-    "Search the NVD for recent CVEs matching a product or keyword (e.g. a plugin name). Returns CVE id, published date, description, and CVSS base score when available.",
     {
-      query: z.string().min(2).describe("Keyword search, e.g. 'wordpress apaczka'"),
-      max_results: z.number().int().min(1).max(10).default(5),
+      title: "CVE Lookup",
+      description: "Search the NVD for recent CVEs matching a product or keyword (e.g. a plugin name). Returns CVE id, published date, description, and CVSS base score when available. Read-only; queries the public NVD API, which can be slow and is keyword-based, so an empty result does not prove no CVE exists.",
+      inputSchema: {
+        query: z.string().min(2).describe("Keyword search, e.g. 'wordpress apaczka'"),
+        max_results: z.number().int().min(1).max(10).default(5),
+      },
+      annotations: READ_ONLY_WEB,
     },
     async ({ query, max_results }) => {
       const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(query)}&resultsPerPage=${max_results}`;
@@ -120,62 +131,105 @@ function buildServer() {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "cvss_score",
-    "Calculate the CVSS 3.1 base score and severity band from a full CVSS vector string.",
-    { vector: z.string().min(10).describe("e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'") },
+    {
+      title: "CVSS Score Calculator",
+      description: "Calculate the CVSS 3.1 base score and severity band from a full CVSS vector string. Pure local calculation; no external calls and nothing is stored.",
+      inputSchema: { vector: z.string().min(10).describe("e.g. 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'") },
+      annotations: READ_ONLY_LOCAL,
+    },
     async ({ vector }) => {
       const score = cvss31(vector);
       return text({ vector, base_score: score, severity: severityBand(score) });
     }
   );
 
-  server.tool(
+  server.registerTool(
     "payout_estimate",
-    "Estimate an Immunefi-style payout: percent of funds at risk, clamped by the program's minimum and maximum bounty.",
     {
-      funds_at_risk_usd: z.number().nonnegative(),
-      percent: z.number().min(0).max(100).describe("Percent of funds at risk paid for this severity, e.g. 10 for Critical on many programs"),
-      max_usd: z.number().nonnegative().optional().describe("Program maximum bounty cap in USD"),
-      min_usd: z.number().nonnegative().optional().describe("Program minimum payout in USD"),
+      title: "Payout Estimate",
+      description: "Estimate an Immunefi-style payout: percent of funds at risk, clamped by the program's minimum and maximum bounty when those bounds are provided. Bounds are optional and independent: if max_usd is omitted the estimate is NOT clamped above and is labelled unbounded_above; if min_usd is omitted it is NOT clamped below and is labelled unbounded_below. When both bounds are provided, min_usd must not exceed max_usd — otherwise the tool returns a clear error instead of an estimate. Pure local calculation; the result is only as good as the funds/percent/bounds supplied.",
+      inputSchema: {
+        funds_at_risk_usd: z.number().nonnegative().describe("Funds at risk in USD that the percent applies to"),
+        percent: z.number().min(0).max(100).describe("Percent of funds at risk paid for this severity, e.g. 10 for Critical on many programs"),
+        max_usd: z.number().nonnegative().optional().describe("Program maximum bounty cap in USD. Optional: omit for no upper clamp (estimate labelled unbounded_above). Must be >= min_usd when both are given."),
+        min_usd: z.number().nonnegative().optional().describe("Program minimum payout in USD. Optional: omit for no lower clamp (estimate labelled unbounded_below). Must be <= max_usd when both are given."),
+      },
+      annotations: READ_ONLY_LOCAL,
     },
     async ({ funds_at_risk_usd, percent, max_usd, min_usd }) => {
+      if (min_usd !== undefined && max_usd !== undefined && min_usd > max_usd) {
+        throw new Error(`Invalid bounds: min_usd ($${min_usd}) must not exceed max_usd ($${max_usd}). Fix the program's minimum/maximum bounty values and try again.`);
+      }
       let estimate = (funds_at_risk_usd * percent) / 100;
       let clampedBy = null;
       if (max_usd !== undefined && estimate > max_usd) { estimate = max_usd; clampedBy = "max"; }
       if (min_usd !== undefined && estimate < min_usd) { estimate = min_usd; clampedBy = "min"; }
+      const unbounded = [];
+      if (max_usd === undefined) unbounded.push("above — no maximum bounty provided, so no upper clamp was applied");
+      if (min_usd === undefined) unbounded.push("below — no minimum payout provided, so no lower clamp was applied");
       return text({
         funds_at_risk_usd,
         percent,
         raw_percent_value_usd: Math.round((funds_at_risk_usd * percent) / 100),
         estimate_usd: Math.round(estimate),
         clamped_by: clampedBy,
+        bounds_applied: { min_usd: min_usd ?? null, max_usd: max_usd ?? null },
+        unbounded: unbounded.length ? unbounded : null,
       });
     }
   );
 
-  server.tool(
+  server.registerTool(
     "program_vet",
-    "Quick-vet a bug bounty program against common deal-breakers: blocked researcher level, pay-to-submit fees, KYC, PoC requirement, low TVL or a low bounty ceiling. Returns flags and a park / look verdict. It does not submit anything.",
     {
-      name: z.string().min(1),
-      level_gate_blocked: z.boolean().default(false).describe("True if your researcher level is blocked on this program"),
-      pay_to_submit_usd: z.number().nonnegative().default(0),
-      kyc_required: z.boolean().default(false),
-      poc_required: z.boolean().default(true),
-      max_bounty_usd: z.number().nonnegative().optional(),
-      tvl_usd: z.number().nonnegative().optional(),
+      title: "Program Vet",
+      description: "Quick-vet a bug bounty program against common deal-breakers, using ONLY the facts you supply. Important: every field except the program name is optional, and an omitted field is treated as UNKNOWN — it is never assumed to be false, zero, or favourable. The verdict lists which facts were confirmed and which are unknown, and is marked provisional when decision-critical facts are missing. Criteria: a confirmed blocked level gate forces a 'Park it' verdict on its own; pay-to-submit above $0 is flagged at its stated per-report cost; KYC and a PoC requirement are flagged as friction; TVL under $1,000,000 is flagged 'low TVL'; a maximum bounty under $10,000 is flagged 'low ceiling'. Three or more flags give a 'Cautious' verdict. This tool verifies nothing itself and submits nothing — supply facts from the program page for a grounded verdict.",
+      inputSchema: {
+        name: z.string().min(1).describe("Program name"),
+        level_gate_blocked: z.boolean().optional().describe("True only if your researcher level is CONFIRMED blocked on this program. Omit if unknown — it will be reported as unknown, not assumed unblocked."),
+        pay_to_submit_usd: z.number().nonnegative().optional().describe("Per-report submission fee in USD, if the program charges one. Omit if unknown; provide 0 only if you confirmed there is no fee."),
+        kyc_required: z.boolean().optional().describe("True if KYC is required to get paid. Omit if unknown."),
+        poc_required: z.boolean().optional().describe("True if a working proof of concept is required. Omit if unknown."),
+        max_bounty_usd: z.number().nonnegative().optional().describe("Program maximum bounty in USD. Omit if unknown — the ceiling will not be judged."),
+        tvl_usd: z.number().nonnegative().optional().describe("Total value locked / funds in scope in USD. Omit if unknown — TVL will not be judged."),
+      },
+      annotations: READ_ONLY_LOCAL,
     },
     async ({ name, level_gate_blocked, pay_to_submit_usd, kyc_required, poc_required, max_bounty_usd, tvl_usd }) => {
       const flags = [];
-      if (level_gate_blocked) flags.push("BLOCKED: your researcher level is gated out of this program.");
-      if (pay_to_submit_usd > 0) flags.push(`Pay-to-submit is on: $${pay_to_submit_usd} per report.`);
-      if (kyc_required) flags.push("KYC required to get paid.");
-      if (poc_required) flags.push("Working PoC required — nothing counts without one.");
-      if (tvl_usd !== undefined && tvl_usd < 1000000) flags.push(`Low TVL: $${tvl_usd.toLocaleString()} — percent-of-funds payouts will be small.`);
-      if (max_bounty_usd !== undefined && max_bounty_usd < 10000) flags.push(`Low ceiling: max bounty $${max_bounty_usd.toLocaleString()}.`);
-      const verdict = level_gate_blocked ? "Park it — level gate blocks you." : flags.length >= 3 ? "Cautious — several friction points." : "Worth a look.";
-      return text({ program: name, verdict, flags, flag_count: flags.length });
+      const unknown = [];
+      if (level_gate_blocked === undefined) unknown.push("level_gate_blocked — whether your level is gated is unknown (not assumed unblocked)");
+      else if (level_gate_blocked) flags.push("BLOCKED: your researcher level is gated out of this program (confirmed).");
+      if (pay_to_submit_usd === undefined) unknown.push("pay_to_submit_usd — submission fee unknown (not assumed free)");
+      else if (pay_to_submit_usd > 0) flags.push(`Pay-to-submit is on: $${pay_to_submit_usd} per report (confirmed).`);
+      if (kyc_required === undefined) unknown.push("kyc_required — KYC requirement unknown");
+      else if (kyc_required) flags.push("KYC required to get paid (confirmed).");
+      if (poc_required === undefined) unknown.push("poc_required — PoC requirement unknown");
+      else if (poc_required) flags.push("Working PoC required — nothing counts without one (confirmed).");
+      if (tvl_usd === undefined) unknown.push("tvl_usd — TVL not provided, so percent-of-funds value was not judged");
+      else if (tvl_usd < 1000000) flags.push(`Low TVL: $${tvl_usd.toLocaleString()} (under the $1,000,000 threshold) — percent-of-funds payouts will be small.`);
+      if (max_bounty_usd === undefined) unknown.push("max_bounty_usd — bounty ceiling not provided, so it was not judged");
+      else if (max_bounty_usd < 10000) flags.push(`Low ceiling: max bounty $${max_bounty_usd.toLocaleString()} (under the $10,000 threshold).`);
+
+      let verdict;
+      if (level_gate_blocked === true) verdict = "Park it — level gate blocks you (confirmed).";
+      else if (level_gate_blocked === undefined) verdict = "Provisional — the level-gate status was not provided, and that is the one fact that can block you outright. Confirm it before relying on this verdict.";
+      else if (flags.length >= 3) verdict = "Cautious — several confirmed friction points.";
+      else verdict = "Worth a look — based only on the confirmed facts supplied.";
+      if (level_gate_blocked === true && unknown.length) verdict += ` Note: ${unknown.length} other fact(s) are still unknown.`;
+      else if (level_gate_blocked === false && unknown.length) verdict += ` Provisional: ${unknown.length} fact(s) unknown.`;
+
+      return text({
+        program: name,
+        verdict,
+        flags,
+        flag_count: flags.length,
+        unknown_facts: unknown,
+        assumptions: "None. Omitted facts are treated as unknown, never as false, zero, or favourable.",
+        criteria: { low_tvl_threshold_usd: 1000000, low_ceiling_threshold_usd: 10000, cautious_flag_count: 3 },
+      });
     }
   );
 
@@ -185,7 +239,7 @@ function buildServer() {
 const app = express();
 app.use(express.json());
 
-app.get("/", (_req, res) => res.json({ ok: true, name: "bug-bounty-triage-mcp", tools: ["wp_plugin_lookup", "cve_lookup", "cvss_score", "payout_estimate", "program_vet"] }));
+app.get("/", (_req, res) => res.json({ ok: true, name: "bug-bounty-triage-mcp", version: "1.1.0", tools: ["wp_plugin_lookup", "cve_lookup", "cvss_score", "payout_estimate", "program_vet"] }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/mcp", async (req, res) => {
