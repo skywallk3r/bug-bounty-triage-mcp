@@ -2,8 +2,12 @@ import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { inject } from "@vercel/analytics";
 
 const UA = "bug-bounty-triage-mcp/1.1 (+https://github.com/skywallk3r/bug-bounty-triage-mcp)";
+
+// Initialize Vercel Analytics
+inject();
 
 async function fetchJson(url, timeoutMs = 15000) {
   const res = await fetch(url, {
@@ -239,7 +243,76 @@ function buildServer() {
 const app = express();
 app.use(express.json());
 
-app.get("/", (_req, res) => res.json({ ok: true, name: "bug-bounty-triage-mcp", version: "1.1.0", tools: ["wp_plugin_lookup", "cve_lookup", "cvss_score", "payout_estimate", "program_vet"] }));
+app.get("/", (req, res) => {
+  // Serve HTML with analytics for browsers, JSON for API clients
+  if (req.accepts("html") && !req.accepts("json")) {
+    res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bug Bounty Triage MCP</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      max-width: 800px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.6;
+      color: #333;
+    }
+    h1 { color: #000; }
+    code {
+      background: #f4f4f4;
+      padding: 0.2rem 0.4rem;
+      border-radius: 3px;
+      font-size: 0.9em;
+    }
+    .endpoint {
+      background: #f8f9fa;
+      border-left: 3px solid #0070f3;
+      padding: 1rem;
+      margin: 1rem 0;
+    }
+    ul { padding-left: 1.5rem; }
+  </style>
+  <script>
+    window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+  </script>
+  <script defer src="/_vercel/insights/script.js"></script>
+</head>
+<body>
+  <h1>Bug Bounty Triage MCP</h1>
+  <p>An MCP server for bug bounty triage. Stateless, no database, no API keys needed.</p>
+  
+  <h2>Tools</h2>
+  <ul>
+    <li><strong>wp_plugin_lookup</strong> — WordPress plugin version, active installs, last updated, requirements and rating from wordpress.org.</li>
+    <li><strong>cve_lookup</strong> — Search the NVD for CVEs matching a product/keyword, with CVSS scores when available.</li>
+    <li><strong>cvss_score</strong> — CVSS 3.1 base score + severity band from a vector string.</li>
+    <li><strong>payout_estimate</strong> — Percent-of-funds-at-risk payout estimate, clamped by a program's min/max.</li>
+    <li><strong>program_vet</strong> — Quick-vet a program for deal-breakers: level gate, pay-to-submit, KYC, PoC required, low TVL, low ceiling.</li>
+  </ul>
+
+  <h2>Endpoints</h2>
+  <div class="endpoint">
+    <strong>POST /mcp</strong><br>
+    MCP protocol endpoint for tool execution
+  </div>
+  <div class="endpoint">
+    <strong>GET /health</strong><br>
+    Health check endpoint
+  </div>
+
+  <p>
+    <a href="https://github.com/skywallk3r/bug-bounty-triage-mcp" target="_blank">View on GitHub</a>
+  </p>
+</body>
+</html>`);
+  } else {
+    res.json({ ok: true, name: "bug-bounty-triage-mcp", version: "1.1.0", tools: ["wp_plugin_lookup", "cve_lookup", "cvss_score", "payout_estimate", "program_vet"] });
+  }
+});
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/mcp", async (req, res) => {
